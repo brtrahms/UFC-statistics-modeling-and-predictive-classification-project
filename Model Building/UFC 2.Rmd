@@ -1,0 +1,204 @@
+---
+title: "UFC Modeling"
+author: "Brandon Trahms"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(permute)
+library(modelr)
+library(party)
+library(caret)
+library(nnet)
+library(rvest)
+library(xml2)
+data <- read.csv("data.csv")
+fight_data <- read.csv("raw_total_fight_data.csv", sep = ";")
+RealData <- read.csv("Test_entries.csv")
+```
+
+# Intro
+  
+I decided to use UFC bout and personal fighter statistics. I am personally a fan of the sport and have done martial arts since I was a small kid which gives me some domain knowledge. I see a lot of great statistics and data here that would be cool to dissect. I am using a data set of historical UFC data taken from Kaggle.com. It provides a lot of data and variables but due to the denseness of this data set it make be hard to properly analyze. The fighter statistics are from when the fight took place but the sport of mma has change alot so the same statistics may not carry the same weight consistently throught out time.
+
+# Data Prep
+```{r}
+# merge two relevant data sets
+process_data <- fight_data[c(1,2,33,38)]
+process_data$date <- as.Date(process_data$date, format = "%B %d, %Y")
+process_data <- merge(process_data, data, by = c("R_fighter", "B_fighter", "date"))
+
+# tidy win_by variable for a model
+process_data <- process_data[c(1, 2, 4, 7, 10:145)] %>%
+  na.omit() %>%
+  filter(Winner != "Draw") 
+  # mutate('Could Not Continue' = (win_by == "Could Not Continue")*1,
+  #        'KO/TKO' = (win_by == "KO/TKO")*1,
+  #        'Decision - Majority' = (win_by == "Decision - Majority")*1,
+  #        'Decision - Split' = (win_by == "Decision - Split")*1,
+  #        'Decision - Unanimous' = (win_by == "Decision - Unanimous")*1,
+  #        'DQ' = (win_by == "DQ")*1,
+  #        'Other' = (win_by == "Other")*1,
+  #        'Overturned' = (win_by == "Overturned")*1,
+  #        'Submission' = (win_by == "Submission")*1,
+  #        "TKO - Doctor's Stoppage" = (win_by == "TKO - Doctor's Stoppage")*1)
+
+process_data <- process_data %>%
+  mutate(B_win_by_KO.TKO = B_win_by_KO.TKO/B_wins)
+
+process_data <- process_data %>%
+  mutate(B_win_by_Submission = B_win_by_Submission/B_wins)
+
+process_data <- process_data %>%
+  mutate(B_win_by_Decision = (B_win_by_Decision_Majority + B_win_by_Decision_Split + B_win_by_Decision_Unanimous)/B_wins)
+
+process_data <- process_data %>%
+  mutate(R_win_by_KO.TKO = R_win_by_KO.TKO/R_wins)
+
+process_data <- process_data %>%
+  mutate(R_win_by_Submission = R_win_by_Submission/R_wins)
+
+process_data <- process_data %>%
+  mutate(R_win_by_Decision = (R_win_by_Decision_Majority + R_win_by_Decision_Split + R_win_by_Decision_Unanimous)/R_wins)
+
+
+process_data$B_win_by_KO.TKO[is.nan(process_data$B_win_by_KO.TKO)] <- 0
+process_data$B_win_by_Submission[is.nan(process_data$B_win_by_Submission)] <- 0
+process_data$B_win_by_Decision[is.nan(process_data$B_win_by_Decision)] <- 0
+
+process_data$R_win_by_KO.TKO[is.nan(process_data$R_win_by_KO.TKO)] <- 0
+process_data$R_win_by_Submission[is.nan(process_data$R_win_by_Submission)] <- 0
+process_data$R_win_by_Decision[is.nan(process_data$R_win_by_Decision)] <- 0
+
+# reverse and append data
+# make Winner variable numeric
+org_data <- process_data
+names(process_data) <- sub('^B_','r_', names(process_data))
+names(process_data) <- sub('^R_','B_', names(process_data))
+names(process_data) <- sub('^r_','R_', names(process_data))
+org_data[4] <- (org_data$Winner == "Red") * 1 - 1 * (org_data$Winner == "Blue")
+process_data[4] <- (process_data$Winner == "Blue") * 1 - 1 * (process_data$Winner == "Red")
+process_data <- rbind(org_data, process_data)
+process_data <- process_data %>% mutate(B_avg_SIG_STR_landed = B_avg_SIG_STR_landed/15 , R_avg_SIG_STR_landed = R_avg_SIG_STR_landed/15, B_avg_opp_SIG_STR_landed = B_avg_opp_SIG_STR_landed/15 , R_avg_opp_SIG_STR_landed = R_avg_opp_SIG_STR_landed/15,)
+
+# drop Unused Variables
+process_data <- process_data[c(3, 4, 5, 7, 8, 9, 10, 11, 16, 18, 24, 56, 57, 59, 60, 61, 65, 66, 69, 70, 71, 72,74,75,76,77, 78, 83, 85, 91, 123,124,126,127,128,132,133,136,137,138,139,140, 141, 142)]
+```
+
+# 3 Data Science Questions
+
+Can we predict the winner of a fight based on both fighter's full statistics?
+Success would be predicting fight winners with a R squared above .8 and failure would be the converse.
+
+Can we predict how a fight will end based on both fighter's full statistics?
+Success would be predicting fight outcome method with a R squared above .8 and failure would be the converse.
+
+Can we predict the winner of a fight based on both fighter's full statistics plus the way they win?
+Success would be predicting fight winners with a R squared above .9 and failure would be the converse.
+
+# Modeling Winner of fight
+
+Input:
+  all Relevant Statistics variables(up to 138) of both fighters and their records used linearly
+    * These are a lot of variable which means it will most likely find a lot of relevant and interesting relationships
+    * However, with so many variables it also makes it harder to narrow in on if a specific relationship is more complex than linear
+  
+Output:
+  1 for Red as the winner
+  -1 for Blue as the winner
+    * The binomial nature allows for me to represent these factors as numeric without much drop in performance.
+    
+If this model works, I would really want to look at predicting win_by as it would require a more complex classifier and most likely multiple models. This data will have impacts on Sports Betting which can come with a lot of financial incentive which can raise some ethical questions of playing a rigged game where I know the outcome.
+
+# Model build Winner
+```{r}
+
+Winner_data <- process_data[-1]
+
+set.seed(123456789)
+Winner_data <- Winner_data[shuffle(nrow(Winner_data)),]
+Train_set <- Winner_data[1:5500,]
+Test_set <- Winner_data[5501:7696,]
+
+win_model <- lm(Winner~ . - R_draw - B_draw, Train_set)
+
+summary(win_model)
+
+Test_set <- Test_set %>% add_predictions(win_model)
+
+Test_set %>%
+  ggplot(aes(x = pred, fill = as.factor(Winner))) + geom_density(alpha = .5)
+
+Test_set <- Test_set %>%
+  mutate(pred = (pred > 0) * 1 - (pred < 0) * 1)
+
+confusionMatrix(as.factor(Test_set$pred), as.factor(Test_set$Winner))
+
+# # NN
+# # Fit the model
+# model <- multinom(Winner ~., data = Train_set, maxit = 500)
+# # Make predictions
+# predicted.classes <- model %>% predict(Test_set)
+# Test_set <- cbind(Test_set, predicted.classes)
+# 
+# confusionMatrix(Test_set$predicted.classes, as.factor(Test_set$Winner))
+# Test_set <- Test_set[-44]
+```
+
+# Model build Win_by
+```{r fig.dim=10000}
+
+Win_data <- process_data[-(2)]
+Win_data$win_by <- as.factor(Win_data$win_by)
+set.seed(1234)
+Win_data <- Win_data[shuffle(nrow(Winner_data)),]
+Train_set <- Win_data[1:5500,]
+Test_set <- Win_data[5501:7696,]
+
+# Conditional Inference Tree
+fit <- ctree(win_by ~ . , data=Train_set)
+# plot(fit, main="Conditional Inference Tree for data")
+png("fit.png", res=80, height=1600, width=14000) 
+   plot(fit) 
+dev.off()
+summary(fit)
+Test_set <- cbind(Test_set, predict(fit, Test_set))
+names(Test_set)[44] <- "pred"
+
+confusionMatrix(Test_set$pred, Test_set$win_by)
+
+# NN
+# Fit the model
+model <- multinom(win_by ~., data = Train_set, maxit = 500)
+# Make predictions
+predicted.classes <- model %>% predict(Test_set)
+Test_set <- cbind(Test_set, predicted.classes)
+
+confusionMatrix(Test_set$predicted.classes, Test_set$win_by)
+
+```
+
+# Real Predictions
+```{r}
+
+# Real Test of win_by
+Real_win_by <-  Train_set %>%
+  rbind(RealData[-c(1,2,4)])
+Real_win_by <- Real_win_by[5501:5514,]
+predicted.classes <- model %>% predict(Real_win_by)
+Real_win_by <- cbind(Real_win_by, predicted.classes)
+confusionMatrix( Real_win_by$predicted.classes, Real_win_by$win_by)
+
+# Real Test of Winner
+RealWinner <- RealData %>% add_predictions(win_model)
+RealWinner <- RealWinner %>% 
+  mutate(pred = (pred > 0) * 1 - (pred < 0) * 1, Winner = (Winner == "Red") * 1 - (Winner == "Blue") * 1)
+confusionMatrix(as.factor(RealWinner$pred), as.factor(RealWinner$Winner))
+
+```
+
